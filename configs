@@ -1,0 +1,14 @@
+img_size: 224
+batch_size: 16
+epochs: 100
+l2_weight: 1.0e-4
+n_folds: 5
+seed: 42
+
+paths:
+  input_root: "/kaggle/input"          # auto-detects dataset containing Training-validation/ and Testing/
+  checkpoint_dir: "/kaggle/working/checkpoints"
+  figures_dir: "/kaggle/working/figures"
+
+tta:
+  augments: 8   # only aug_index 0 (original) and 1 (h-flip) are implemented; extend apply_tta_augmentation() for more
