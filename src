@@ -1,0 +1,2022 @@
+====asam_internals====
+ASAM internal-mechanism visualizations: Adaptive Scale Layer heatmaps,
+Dynamic Temperature values, Dual-Path Alpha Blending, ASAM Output
+Attention Map, and Local-vs-Global Path Comparison.
+
+*** IMPORTANT — READ BEFORE USE ***
+The 5 original Zenodo.rar files for these plots ("ADAPTIVE SCALE LAYER",
+"DYNAMIC TEMPERATURE LAYER", "DUAL-PATH ALPHA BLENDING",
+"ASAM OUTPUT ATTENTION MAP per class", "LOCAL PATH vs GLOBAL PATH
+COMPARISON") all reference variables that are used but never defined in
+any of the 24 exported files:
+    model, class_images, VIZ_DIR, CLASS_COLORS,
+    adaptive_scale_layers, dynamic_temp_layers, dense_sigmoid_layers,
+    add_layers, depthwise_layers
+This means the notebook that produced Zenodo.rar had one more "setup"
+cell that was not exported/included in the .rar archive.
+
+The `setup_asam_internals()` function below reconstructs that missing
+cell. It is NOT copy-pasted from your files (nothing to copy — it wasn't
+there) — it is inferred from how each variable is *used* downstream:
+  - model                -> alias for best_model (all usages treat it
+                             identically to best_model elsewhere in your
+                             exports)
+  - class_images          -> same one-image-per-class dict as
+                             `sample_images` in interpretability.py
+  - VIZ_DIR               -> output folder for these 5 figures
+  - CLASS_COLORS          -> the same 4-color palette used everywhere
+                             else in your exports
+  - *_layers lists        -> discovered by isinstance()/name check
+                             against the actual layer types each script
+                             is looking for (verified against
+                             src/model.py's build_model() graph)
+
+If this differs from what you actually had, please share the missing
+setup cell and it can be swapped in directly.
+"""
+
+import os
+
+import cv2
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+import matplotlib.pyplot as plt
+
+from .model import AdaptiveScaleLayer, DynamicTemperatureLayer
+
+CLASS_COLORS = ["#2ecc71", "#3498db", "#e74c3c", "#9b59b6"]
+
+
+def setup_asam_internals(best_model, sample_images, viz_dir: str = "/kaggle/working/viz_asam_internals"):
+    """Reconstructed setup cell -- see module docstring."""
+    os.makedirs(viz_dir, exist_ok=True)
+
+    model = best_model  # alias, matches how the original scripts refer to it
+    class_images = sample_images  # same one-per-class dict used elsewhere
+
+    adaptive_scale_layers = [l.name for l in model.layers if isinstance(l, AdaptiveScaleLayer)]
+    dynamic_temp_layers = [l.name for l in model.layers if isinstance(l, DynamicTemperatureLayer)]
+    dense_sigmoid_layers = [
+        l.name for l in model.layers
+        if isinstance(l, layers.Dense) and l.activation == tf.keras.activations.sigmoid
+    ]
+    add_layers = [l.name for l in model.layers if isinstance(l, layers.Add)]
+    depthwise_layers = [l.name for l in model.layers if isinstance(l, layers.DepthwiseConv2D)]
+
+    return {
+        "model": model,
+        "class_images": class_images,
+        "VIZ_DIR": viz_dir,
+        "adaptive_scale_layers": adaptive_scale_layers,
+        "dynamic_temp_layers": dynamic_temp_layers,
+        "dense_sigmoid_layers": dense_sigmoid_layers,
+        "add_layers": add_layers,
+        "depthwise_layers": depthwise_layers,
+    }
+
+
+# ---------------------------------------------------------------------
+# "ADAPTIVE SCALE LAYER -- Heatmap per class.txt"
+# ---------------------------------------------------------------------
+def plot_adaptive_scale_heatmap(ctx, class_names, num_classes: int):
+    model, class_images, viz_dir = ctx["model"], ctx["class_images"], ctx["VIZ_DIR"]
+    adaptive_scale_layers = ctx["adaptive_scale_layers"]
+
+    if not adaptive_scale_layers:
+        print("  AdaptiveScaleLayer nahi mili — skip.")
+        return None, None
+
+    scale_extractor = models.Model(inputs=model.input,
+                                    outputs=model.get_layer(adaptive_scale_layers[0]).output)
+
+    fig, axes = plt.subplots(2, num_classes, figsize=(5 * num_classes, 10))
+    fig.suptitle("Adaptive Scale Layer — Channel-wise Scale Factors per Class",
+                 fontsize=15, fontweight="bold", y=1.01)
+
+    scale_vals_all = []
+    for ci, cname in enumerate(class_names):
+        img_batch = class_images[cname][np.newaxis, ...]
+        scaled_fm = scale_extractor.predict(img_batch, verbose=0)
+
+        scale_per_channel = np.mean(scaled_fm[0], axis=(0, 1))
+        scale_vals_all.append(scale_per_channel)
+        orig_mean = np.mean(scaled_fm[0], axis=-1)
+
+        ax1 = axes[0, ci]
+        im1 = ax1.imshow(orig_mean, cmap="hot", interpolation="bilinear")
+        ax1.set_title(f"{cname}\nFeature Map (post-scale)", fontsize=11, fontweight="bold")
+        ax1.axis("off")
+        plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+        ax2 = axes[1, ci]
+        top_n = min(32, len(scale_per_channel))
+        ch_idx = np.argsort(scale_per_channel)[::-1][:top_n]
+        ax2.bar(range(top_n), scale_per_channel[ch_idx],
+                color=CLASS_COLORS[ci % len(CLASS_COLORS)], alpha=0.85, edgecolor="white")
+        ax2.set_title(f"Top-{top_n} Channel Scales", fontsize=10)
+        ax2.set_xlabel("Channel Index (sorted)", fontsize=9)
+        ax2.set_ylabel("Scale Value", fontsize=9)
+        ax2.grid(axis="y", alpha=0.3)
+        ax2.spines[["top", "right"]].set_visible(False)
+
+    plt.tight_layout()
+    save_path = os.path.join(viz_dir, "viz1_adaptive_scale_heatmap.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {save_path}")
+
+    fig2, ax = plt.subplots(figsize=(10, 5))
+    means = [np.mean(s) for s in scale_vals_all]
+    stds = [np.std(s) for s in scale_vals_all]
+    bars = ax.bar(class_names, means, color=CLASS_COLORS[:num_classes], yerr=stds, capsize=5,
+                   alpha=0.85, edgecolor="white")
+    for bar, val in zip(bars, means):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.002,
+                f"{val:.3f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+    ax.set_title("Mean Adaptive Scale Factor per Class", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Mean Scale Factor")
+    ax.set_xlabel("Class")
+    ax.grid(axis="y", alpha=0.3)
+    ax.spines[["top", "right"]].set_visible(False)
+    plt.tight_layout()
+    save_path2 = os.path.join(viz_dir, "viz1b_scale_summary.png")
+    plt.savefig(save_path2, dpi=150, bbox_inches="tight")
+    print(f"Saved: {save_path2}")
+
+    return fig, fig2
+
+
+# ---------------------------------------------------------------------
+# "DYNAMIC TEMPERATURE LAYER -- Value per class.txt"
+# ---------------------------------------------------------------------
+def plot_dynamic_temperature_value(ctx, class_names, num_classes: int):
+    model, class_images, viz_dir = ctx["model"], ctx["class_images"], ctx["VIZ_DIR"]
+    dynamic_temp_layers = ctx["dynamic_temp_layers"]
+
+    if not dynamic_temp_layers:
+        print("  DynamicTemperatureLayer nahi mili — skip.")
+        return None
+
+    temp_extractor = models.Model(inputs=model.input, outputs=model.get_layer(dynamic_temp_layers[0]).output)
+
+    temp_values = []
+    for cname in class_names:
+        img_batch = class_images[cname][np.newaxis, ...]
+        temp = temp_extractor.predict(img_batch, verbose=0)
+        temp_values.append(float(temp.squeeze()))
+
+    print("  Temperature values per class:")
+    for cname, tv in zip(class_names, temp_values):
+        print(f"    {cname}: {tv:.4f}")
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+    bars = ax.bar(class_names, temp_values, color=CLASS_COLORS[:num_classes], alpha=0.85, edgecolor="white")
+    for bar, val in zip(bars, temp_values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                f"{val:.3f}", ha="center", va="bottom", fontsize=11, fontweight="bold")
+
+    ax.axhline(y=1.0, color="gray", linestyle="--", lw=1.5, label="T=1 (neutral)")
+    ax.set_title("Dynamic Temperature Layer — Value per Class", fontsize=14, fontweight="bold", pad=15)
+    ax.set_xlabel("Class (Low T = Sharp Attention  |  High T = Soft Attention)", fontsize=11)
+    ax.set_ylabel("Temperature Value", fontsize=11)
+    ax.set_ylim([0, max(temp_values) * 1.45])
+    ax.legend(fontsize=10)
+    ax.grid(axis="y", alpha=0.3)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    min_idx = int(np.argmin(temp_values))
+    max_idx = int(np.argmax(temp_values))
+    y_offset = max(temp_values) * 0.55
+
+    ax.annotate("Sharpest\nAttention", xy=(min_idx, temp_values[min_idx]),
+                xytext=(min_idx, temp_values[min_idx] + y_offset), ha="center",
+                arrowprops=dict(arrowstyle="->", color="red", lw=1.5), color="red", fontsize=10, fontweight="bold")
+    ax.annotate("Softest\nAttention", xy=(max_idx, temp_values[max_idx]),
+                xytext=(max_idx, temp_values[max_idx] + y_offset * 0.85), ha="center",
+                arrowprops=dict(arrowstyle="->", color="#2980b9", lw=1.5), color="#2980b9", fontsize=10, fontweight="bold")
+
+    plt.tight_layout()
+    save_path = os.path.join(viz_dir, "viz2_dynamic_temperature.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {save_path}")
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "DUAL-PATH ALPHA BLENDING -- per class.txt"
+# ---------------------------------------------------------------------
+def plot_dual_path_alpha_blending(ctx, class_names, num_classes: int):
+    model, class_images, viz_dir = ctx["model"], ctx["class_images"], ctx["VIZ_DIR"]
+    dense_sigmoid_layers = ctx["dense_sigmoid_layers"]
+
+    if not dense_sigmoid_layers:
+        print("  Alpha Dense layer nahi mila — skip.")
+        return None
+
+    alpha_layer_name = dense_sigmoid_layers[0]
+    alpha_extractor = models.Model(inputs=model.input, outputs=model.get_layer(alpha_layer_name).output)
+
+    alpha_per_class, alpha_means, alpha_stds = {}, [], []
+    for cname in class_names:
+        img_batch = class_images[cname][np.newaxis, ...]
+        alpha_vec = alpha_extractor.predict(img_batch, verbose=0)[0]
+        alpha_per_class[cname] = alpha_vec
+        alpha_means.append(float(np.mean(alpha_vec)))
+        alpha_stds.append(float(np.std(alpha_vec)))
+        print(f"  {cname}: mean_alpha={alpha_means[-1]:.4f} \u00b1 {alpha_stds[-1]:.4f} "
+              f"| global={alpha_means[-1]:.2%}  local={(1-alpha_means[-1]):.2%}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle("Dual-Path Alpha Blending — Global vs Local Contribution", fontsize=14, fontweight="bold")
+
+    ax = axes[0]
+    x = np.arange(num_classes)
+    global_vals = alpha_means
+    local_vals = [1 - a for a in alpha_means]
+
+    ax.bar(x, global_vals, color="#3498db", alpha=0.88, label="Global Path (Self-Attention)", edgecolor="white")
+    ax.bar(x, local_vals, bottom=global_vals, color="#e74c3c", alpha=0.88,
+           label="Local Path (Depthwise Conv)", edgecolor="white")
+
+    for i, (g, l, s) in enumerate(zip(global_vals, local_vals, alpha_stds)):
+        ax.text(i, g / 2, f"{g:.2%}", ha="center", va="center", fontsize=10, fontweight="bold", color="white")
+        ax.text(i, g + l / 2, f"{l:.2%}", ha="center", va="center", fontsize=10, fontweight="bold", color="white")
+        ax.errorbar(i, g, yerr=s, fmt="none", color="black", capsize=5, lw=1.5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(class_names, rotation=15, ha="right")
+    ax.set_ylim([0, 1.15])
+    ax.set_ylabel("Contribution Ratio (mean \u00b1 std)")
+    ax.set_xlabel("Class")
+    ax.set_title("Mean Alpha per Class\n(error bar = channel std)", fontsize=12)
+    ax.legend(fontsize=10)
+    ax.grid(axis="y", alpha=0.3)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    ax2 = axes[1]
+    data_to_plot = [alpha_per_class[cn] for cn in class_names]
+    bp = ax2.boxplot(data_to_plot, patch_artist=True, notch=False, medianprops=dict(color="black", lw=2))
+    for patch, color in zip(bp["boxes"], CLASS_COLORS[:num_classes]):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.75)
+    for element in ["whiskers", "caps", "fliers"]:
+        for item in bp[element]:
+            item.set_color("gray")
+
+    ax2.set_xticklabels(class_names, rotation=15, ha="right")
+    ax2.set_ylabel("Alpha Value (per channel)")
+    ax2.set_xlabel("Class")
+    ax2.set_title("Per-Channel Alpha Distribution\n(box = Q1\u2013Q3, line = median)", fontsize=12)
+    ax2.axhline(0.5, color="gray", linestyle="--", lw=1, label="0.5 (equal blend)")
+    ax2.legend(fontsize=9)
+    ax2.grid(axis="y", alpha=0.3)
+    ax2.spines[["top", "right"]].set_visible(False)
+
+    plt.tight_layout()
+    save_path = os.path.join(viz_dir, "viz3_alpha_blending.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {save_path}")
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "ASAM OUTPUT ATTENTION MAP per class.txt"
+# ---------------------------------------------------------------------
+def plot_asam_output_attention_map(ctx, class_names, num_classes: int, img_size: int = 224):
+    model, class_images, viz_dir = ctx["model"], ctx["class_images"], ctx["VIZ_DIR"]
+    add_layers = ctx["add_layers"]
+
+    if not add_layers:
+        print("  Add layers nahi mili — skip.")
+        return None, None
+
+    asam_add_name = None
+    for lname in add_layers:
+        try:
+            out_shape = model.get_layer(lname).output.shape
+            if len(out_shape) == 4 and out_shape[-1] == 256:
+                asam_add_name = lname
+                break
+        except Exception:
+            continue
+
+    if not asam_add_name:
+        print("  ASAM Add layer (256ch) nahi mila — skip.")
+        return None, None
+
+    print(f"  ASAM output layer: {asam_add_name}")
+    asam_extractor = models.Model(inputs=model.input, outputs=model.get_layer(asam_add_name).output)
+
+    fig, axes = plt.subplots(2, num_classes, figsize=(5 * num_classes, 10))
+    fig.suptitle("ASAM Output — Attention Map per Class", fontsize=15, fontweight="bold", y=1.01)
+
+    for ci, cname in enumerate(class_names):
+        img_batch = class_images[cname][np.newaxis, ...]
+        feat_map = asam_extractor.predict(img_batch, verbose=0)[0]
+
+        attn_map = np.mean(feat_map, axis=-1)
+        attn_min, attn_max = attn_map.min(), attn_map.max()
+        attn_norm = (attn_map - attn_min) / (attn_max - attn_min) if attn_max > attn_min else attn_map
+        attn_resized = cv2.resize(attn_norm, (img_size, img_size))
+
+        ax1 = axes[0, ci]
+        orig_img = class_images[cname]
+        ax1.imshow(orig_img)
+        ax1.imshow(attn_resized, cmap="jet", alpha=0.45)
+        ax1.set_title(f"{cname}\nAttention Overlay", fontsize=11, fontweight="bold")
+        ax1.axis("off")
+
+        ax2 = axes[1, ci]
+        im2 = ax2.imshow(attn_resized, cmap="hot", interpolation="bilinear")
+        ax2.set_title("Pure Attention Map", fontsize=10)
+        ax2.axis("off")
+        plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    save_path = os.path.join(viz_dir, "viz4_asam_attention_map.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {save_path}")
+    return fig, asam_add_name
+
+
+# ---------------------------------------------------------------------
+# "LOCAL PATH vs GLOBAL PATH COMPARISON.txt"
+# ---------------------------------------------------------------------
+def plot_local_vs_global_path(ctx, class_names, num_classes: int, img_size: int = 224,
+                               asam_add_name: str = None):
+    model, class_images, viz_dir = ctx["model"], ctx["class_images"], ctx["VIZ_DIR"]
+    depthwise_layers = ctx["depthwise_layers"]
+
+    if not depthwise_layers:
+        print("  DepthwiseConv2D layer nahi mili — skip.")
+        return None
+
+    local_layer_name = depthwise_layers[0]
+
+    global_layer_name = None
+    softmax_idx = None
+    for i, layer in enumerate(model.layers):
+        if isinstance(layer, layers.Softmax):
+            softmax_idx = i
+            break
+    if softmax_idx is not None:
+        for layer in model.layers[softmax_idx + 1:]:
+            if isinstance(layer, layers.Conv2D) and len(layer.output.shape) == 4:
+                global_layer_name = layer.name
+                break
+
+    print(f"  Local  layer: {local_layer_name}")
+    print(f"  Global layer: {global_layer_name}")
+
+    try:
+        output_layers = [model.get_layer(local_layer_name).output]
+        if global_layer_name:
+            output_layers.append(model.get_layer(global_layer_name).output)
+        dual_extractor = models.Model(inputs=model.input, outputs=output_layers)
+
+        fig, axes = plt.subplots(3, num_classes, figsize=(5 * num_classes, 14))
+        fig.suptitle("Local Path (DepthwiseConv) vs Global Path (Self-Attention) — per Class",
+                     fontsize=14, fontweight="bold", y=1.01)
+
+        asam_extractor = None
+        if asam_add_name:
+            asam_extractor = models.Model(inputs=model.input, outputs=model.get_layer(asam_add_name).output)
+
+        for ci, cname in enumerate(class_names):
+            img_batch = class_images[cname][np.newaxis, ...]
+            orig_img = class_images[cname]
+            results = dual_extractor.predict(img_batch, verbose=0)
+
+            local_fm = results[0][0] if isinstance(results, list) else results[0]
+            local_map = np.mean(local_fm, axis=-1)
+            lmin, lmax = local_map.min(), local_map.max()
+            local_norm = (local_map - lmin) / (lmax - lmin + 1e-8)
+            local_resized = cv2.resize(local_norm, (img_size, img_size))
+
+            if global_layer_name and isinstance(results, list) and len(results) > 1:
+                global_fm = results[1][0]
+                global_map = np.mean(global_fm, axis=-1)
+                gmin, gmax = global_map.min(), global_map.max()
+                global_norm = (global_map - gmin) / (gmax - gmin + 1e-8)
+                global_resized = cv2.resize(global_norm, (img_size, img_size))
+            elif asam_extractor is not None:
+                fb = asam_extractor.predict(img_batch, verbose=0)[0]
+                gm = np.mean(fb, axis=-1)
+                global_resized = cv2.resize((gm - gm.min()) / (gm.max() - gm.min() + 1e-8), (img_size, img_size))
+            else:
+                global_resized = np.zeros((img_size, img_size))
+
+            axes[0, ci].imshow(orig_img)
+            axes[0, ci].set_title(f"{cname}\nOriginal", fontsize=11, fontweight="bold")
+            axes[0, ci].axis("off")
+
+            axes[1, ci].imshow(orig_img)
+            im2 = axes[1, ci].imshow(local_resized, cmap="Greens", alpha=0.60, vmin=0, vmax=1)
+            axes[1, ci].set_title("Local Path\n(DepthwiseConv)", fontsize=10, color="#27ae60", fontweight="bold")
+            axes[1, ci].axis("off")
+            plt.colorbar(im2, ax=axes[1, ci], fraction=0.046, pad=0.04)
+
+            axes[2, ci].imshow(orig_img)
+            im3 = axes[2, ci].imshow(global_resized, cmap="Blues", alpha=0.60, vmin=0, vmax=1)
+            axes[2, ci].set_title("Global Path\n(Self-Attention)", fontsize=10, color="#2980b9", fontweight="bold")
+            axes[2, ci].axis("off")
+            plt.colorbar(im3, ax=axes[2, ci], fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+        save_path = os.path.join(viz_dir, "viz5_local_vs_global_path.png")
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+        return fig
+
+    except Exception as e:
+        print(f"  Viz 5 error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+Evaluates a trained 5-fold ensemble on the held-out test set:
+  1. F1-weighted ensemble of the 5 fold models.
+  2. Test-time augmentation (TTA) applied on top of the best fold model.
+  3. Reports whichever of (ensemble, ensemble+TTA) scores higher macro F1;
+     that becomes the final reported test result.
+
+Usage:
+    python -m src.evaluate --config configs/config.yaml
+(Run after src.train has produced fold checkpoints.)
+"""
+
+import argparse
+import os
+
+import numpy as np
+import tensorflow as tf
+import yaml
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
+
+from .model import CUSTOM_OBJECTS
+from .preprocess import preprocess
+from .train import load_class_folder, run_cross_validation
+from .utils import find_dataset_root
+
+
+def apply_tta_augmentation(X: np.ndarray, aug_index: int) -> np.ndarray:
+    """Deterministic TTA augmentation. Only original (0) and horizontal
+    flip (1) are implemented; extend with more augmentations as needed.
+    """
+    X_aug = X.copy()
+    if aug_index == 0:
+        pass  # original
+    elif aug_index == 1:
+        X_aug = X_aug[:, :, ::-1, :]  # horizontal flip
+    return X_aug.astype(np.float32)
+
+
+def evaluate_ensemble_and_tta(cfg: dict, cv_result: dict):
+    dataset_root = find_dataset_root(cfg["paths"]["input_root"])
+    test_dir = os.path.join(dataset_root, "Testing")
+    class_names = cv_result["class_names"]
+    img_size = cfg["img_size"]
+
+    X_test, y_test = load_class_folder(test_dir, class_names, img_size)
+    print(f"\nTest images: {len(X_test)}")
+
+    fold_ckpts = cv_result["fold_ckpts"]
+    cv_f1 = cv_result["cv_f1"]
+    best_ckpt = cv_result["best_ckpt"]
+
+    # --- Ensemble (F1-weighted average of fold predictions) ---
+    all_preds = []
+    for ckpt_path in fold_ckpts:
+        fold_model = tf.keras.models.load_model(ckpt_path, custom_objects=CUSTOM_OBJECTS)
+        all_preds.append(fold_model.predict(X_test, verbose=0))
+
+    fold_weights = np.array(cv_f1) / np.sum(cv_f1)
+    ensemble_preds = np.average(all_preds, axis=0, weights=fold_weights)
+    ensemble_classes = np.argmax(ensemble_preds, axis=1)
+
+    ensemble_acc = np.mean(ensemble_classes == y_test)
+    ensemble_f1 = f1_score(y_test, ensemble_classes, average="macro")
+    print(f"\nEnsemble Accuracy: {ensemble_acc:.4f} ({ensemble_acc*100:.2f}%)")
+    print(f"Ensemble Macro F1: {ensemble_f1:.4f}")
+    print(classification_report(y_test, ensemble_classes, target_names=class_names))
+    print(confusion_matrix(y_test, ensemble_classes))
+
+    # --- TTA on top of the best fold model ---
+    tta_augments = cfg.get("tta", {}).get("augments", 8)
+    tta_model = tf.keras.models.load_model(best_ckpt, custom_objects=CUSTOM_OBJECTS)
+
+    aug_preds = []
+    for i in range(tta_augments):
+        X_aug = apply_tta_augmentation(X_test, aug_index=i)
+        aug_preds.append(tta_model.predict(X_aug, verbose=0))
+
+    tta_preds = np.mean(aug_preds, axis=0)
+    tta_classes = np.argmax(tta_preds, axis=1)
+    tta_acc = np.mean(tta_classes == y_test)
+    tta_f1 = f1_score(y_test, tta_classes, average="macro")
+    print(f"\nTTA Accuracy: {tta_acc:.4f} ({tta_acc*100:.2f}%)")
+    print(f"TTA Macro F1: {tta_f1:.4f}")
+    print(classification_report(y_test, tta_classes, target_names=class_names))
+    print(confusion_matrix(y_test, tta_classes))
+
+    use_tta = tta_f1 > ensemble_f1
+    print("\nUsing TTA predictions." if use_tta else "\nUsing ensemble predictions.")
+
+    y_pred = tta_classes if use_tta else ensemble_classes
+    y_pred_proba = tta_preds if use_tta else ensemble_preds
+
+    return {
+        "X_test": X_test,
+        "y_test": y_test,
+        "y_pred": y_pred,
+        "y_pred_proba": y_pred_proba,
+        "ensemble_acc": ensemble_acc,
+        "ensemble_f1": ensemble_f1,
+        "tta_acc": tta_acc,
+        "tta_f1": tta_f1,
+        "use_tta": use_tta,
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/config.yaml")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    cv_result = run_cross_validation(cfg)
+    evaluate_ensemble_and_tta(cfg, cv_result)
+"""
+Interpretability visualizations: Grad-CAM, attention maps, ASAM-vs-Grad-CAM
+agreement, and t-SNE. Faithful ports of the corresponding Zenodo.rar files
+(named in each docstring), turned into functions.
+
+Shared inputs used throughout:
+  best_model   -- the loaded best-fold Keras model
+  class_names  -- list of class name strings
+  sample_images -- dict {class_name: preprocessed_image}, one per class
+                    (see get_sample_images below; matches "sample_images"
+                    used across the original GRAD-CAM / ATTENTION scripts)
+  conv_layers  -- list of Conv2D layer names in best_model
+                    (see get_conv_layers below)
+"""
+
+import cv2
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from tensorflow.keras import models
+from scipy.stats import spearmanr
+from sklearn.manifold import TSNE
+
+CLASS_COLORS = ["#2ecc71", "#3498db", "#e74c3c", "#9b59b6"]
+
+
+def get_sample_images(test_dir, class_names, preprocess_fn):
+    """One preprocessed sample image per class (first test file alphabetically).
+    Matches the `sample_images` dict used across the original Grad-CAM /
+    Attention scripts.
+    """
+    import os
+    samples = {}
+    for cname in class_names:
+        folder = os.path.join(test_dir, cname)
+        fname = sorted(os.listdir(folder))[0]
+        samples[cname] = preprocess_fn(os.path.join(folder, fname))
+    return samples
+
+
+def get_conv_layers(best_model):
+    """List of Conv2D layer names. Matches `conv_layers` used by
+    CLASS ACTIVATION COMPARISON.txt.
+    """
+    return [l.name for l in best_model.layers if isinstance(l, tf.keras.layers.Conv2D)]
+
+
+# ---------------------------------------------------------------------
+# "GRAD-CAM LESION LOCALIZATION.txt"
+# ---------------------------------------------------------------------
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
+    grad_model = tf.keras.models.Model(
+        model.inputs, [model.get_layer(last_conv_layer_name).output, model.output]
+    )
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        pred_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, pred_index]
+    grads = tape.gradient(class_channel, conv_outputs)
+    pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_out = conv_outputs[0]
+    heatmap = conv_out @ pooled[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
+    return heatmap.numpy()
+
+
+def plot_gradcam_lesion_localization(best_model, sample_images, class_names, conv_layers,
+                                      img_size: int = 224):
+    last_conv = conv_layers[-1]
+
+    fig, axes = plt.subplots(len(class_names), 3, figsize=(12, len(class_names) * 3.5))
+    fig.suptitle("Grad-CAM Lesion Localization", fontsize=16, fontweight="bold")
+
+    for ci, cname in enumerate(class_names):
+        img = sample_images[cname]
+        inp = np.expand_dims(img, 0)
+        hmap = make_gradcam_heatmap(inp, best_model, last_conv)
+        hmap = cv2.resize(hmap, (img_size, img_size))
+        hmap = np.uint8(255 * hmap)
+        hmap_color = cv2.applyColorMap(hmap, cv2.COLORMAP_JET)
+        hmap_color = cv2.cvtColor(hmap_color, cv2.COLOR_BGR2RGB)
+        overlay = img * 0.55 + hmap_color / 255.0 * 0.45
+        overlay = np.clip(overlay, 0, 1)
+
+        axes[ci][0].imshow(img)
+        axes[ci][0].set_title("Original" if ci == 0 else "")
+        axes[ci][1].imshow(hmap_color)
+        axes[ci][1].set_title("Grad-CAM Heatmap" if ci == 0 else "")
+        axes[ci][2].imshow(overlay)
+        axes[ci][2].set_title("Overlay" if ci == 0 else "")
+        axes[ci][0].set_ylabel(cname, fontsize=11, fontweight="bold",
+                                color=CLASS_COLORS[ci % len(CLASS_COLORS)])
+        for ax in axes[ci]:
+            ax.axis("off")
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "ATTENTION MAP VISUALIZATION.txt"
+# ---------------------------------------------------------------------
+def plot_attention_map_visualization(best_model, sample_images, class_names, img_size: int = 224):
+    attention_layer_names = [l.name for l in best_model.layers if "multiply" in l.name.lower()]
+    if not attention_layer_names:
+        print("  No 'multiply' layer found — skipping Attention Map Visualization.")
+        return None
+
+    att_model = models.Model(inputs=best_model.input,
+                              outputs=best_model.get_layer(attention_layer_names[0]).output)
+
+    fig, axes = plt.subplots(len(class_names), 4, figsize=(16, len(class_names) * 3.5))
+    fig.suptitle("Attention Map Visualization (Channel Attention Output)", fontsize=15, fontweight="bold")
+
+    for ci, cname in enumerate(class_names):
+        img = sample_images[cname]
+        att_maps = att_model.predict(np.expand_dims(img, 0), verbose=0)
+        hmap = np.mean(att_maps[0], axis=-1)
+        hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min() + 1e-8)
+        hmap_up = cv2.resize(hmap, (img_size, img_size))
+        hmap_col = cv2.applyColorMap(np.uint8(255 * hmap_up), cv2.COLORMAP_HOT)
+        hmap_col = cv2.cvtColor(hmap_col, cv2.COLOR_BGR2RGB)
+        overlay = np.clip(img * 0.6 + hmap_col / 255.0 * 0.4, 0, 1)
+
+        for ax_idx, (disp, ttl) in enumerate(zip(
+                [img, hmap_up, hmap_col, overlay],
+                ["Original", "Attention (grey)", "Attention (color)", "Overlay"])):
+            ax = axes[ci][ax_idx]
+            cmap_use = "hot" if ax_idx == 1 else None
+            ax.imshow(disp, cmap=cmap_use)
+            ax.axis("off")
+            if ci == 0:
+                ax.set_title(ttl, fontsize=11, fontweight="bold")
+        axes[ci][0].set_ylabel(cname, fontsize=11, fontweight="bold", color=CLASS_COLORS[ci % len(CLASS_COLORS)])
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "ATTENTION HEATMAP COMPARISON.txt"
+# ---------------------------------------------------------------------
+def plot_attention_heatmap_comparison(best_model, sample_images, class_names, img_size: int = 224):
+    important_layers = []
+    for l in best_model.layers:
+        if isinstance(l, (tf.keras.layers.Conv2D, tf.keras.layers.BatchNormalization,
+                           tf.keras.layers.ReLU, tf.keras.layers.Add, tf.keras.layers.Multiply)):
+            important_layers.append(l.name)
+
+    step_size = max(1, len(important_layers) // 6)
+    selected_lyr = important_layers[::step_size][:6]
+
+    chosen_class = class_names[0]
+    chosen_img = sample_images[chosen_class]
+
+    feat_models_list = [models.Model(inputs=best_model.input, outputs=best_model.get_layer(n).output)
+                         for n in selected_lyr]
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    fig.suptitle(f"Attention Heatmap Comparison — Intermediate Layers\n(Class: {chosen_class})",
+                 fontsize=14, fontweight="bold")
+
+    for li, (lname, fm) in enumerate(zip(selected_lyr, feat_models_list)):
+        ax = axes[li // 3][li % 3]
+        fmap = fm.predict(np.expand_dims(chosen_img, 0), verbose=0)
+        if len(fmap.shape) == 4:
+            hmap = np.mean(fmap[0], axis=-1)
+        else:
+            hmap = fmap[0].reshape(int(np.sqrt(fmap.shape[-1])), int(np.sqrt(fmap.shape[-1])))
+        hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min() + 1e-8)
+        hmap = cv2.resize(hmap, (img_size, img_size))
+        hmap_col = cv2.applyColorMap(np.uint8(255 * hmap), cv2.COLORMAP_JET)
+        hmap_col = cv2.cvtColor(hmap_col, cv2.COLOR_BGR2RGB)
+        overlay = np.clip(chosen_img * 0.55 + hmap_col / 255.0 * 0.45, 0, 1)
+        ax.imshow(overlay)
+        ax.set_title(lname, fontsize=9, fontweight="bold")
+        ax.axis("off")
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "CLASS ACTIVATION COMPARISON -- PER CLASS.txt"
+# Depends on `make_gradcam_heatmap_fixed`, which was referenced but not
+# defined in any file of the Zenodo export. Reconstructed here per the
+# script's own inline comments ("Absolute gradients — flat heatmap fix",
+# "Robust normalization" via 5-95 percentile clip) -- see README for notes.
+# ---------------------------------------------------------------------
+def make_gradcam_heatmap_fixed(img_array, model, last_conv_layer_name):
+    """Reconstructed (see module docstring): same Grad-CAM mechanics as
+    make_gradcam_heatmap, but with absolute-value gradient pooling and
+    5th/95th percentile-clipped normalization for a less flat heatmap.
+    """
+    grad_model = tf.keras.models.Model(
+        model.inputs, [model.get_layer(last_conv_layer_name).output, model.output]
+    )
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        pred_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, pred_index]
+    grads = tape.gradient(class_channel, conv_outputs)
+    pooled = tf.reduce_mean(tf.abs(grads), axis=(0, 1, 2))
+    conv_out = conv_outputs[0]
+    heatmap = conv_out @ pooled[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap).numpy()
+    p5, p95 = np.percentile(heatmap, 5), np.percentile(heatmap, 95)
+    heatmap = np.clip(heatmap, p5, p95)
+    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+    return heatmap
+
+
+def plot_class_activation_comparison(best_model, sample_images, X_test, y_test, class_names,
+                                      conv_layers, img_size: int = 224):
+    _probe_inp = np.expand_dims(sample_images[class_names[0]], 0)
+    best_layer, best_std = None, -1
+    for lname in conv_layers:
+        try:
+            h = make_gradcam_heatmap_fixed(_probe_inp, best_model, lname)
+            std = np.std(h)
+            if std > best_std:
+                best_std, best_layer = std, lname
+        except Exception:
+            continue
+    print(f"Best Conv Layer: {best_layer}  (std={best_std:.4f})")
+
+    grad_model = models.Model(inputs=best_model.inputs,
+                               outputs=[best_model.get_layer(best_layer).output, best_model.output])
+
+    num_classes = len(class_names)
+    fig, axes = plt.subplots(1, num_classes, figsize=(num_classes * 4, 4.5))
+    fig.patch.set_facecolor("black")
+    fig.suptitle("Class Activation Comparison", fontsize=15, fontweight="bold", color="white", y=1.02)
+
+    for i, cname in enumerate(class_names):
+        idx = np.where(y_test == i)[0][0]
+        img = X_test[idx:idx + 1]
+
+        with tf.GradientTape() as tape:
+            conv_out, preds = grad_model(img)
+            loss = preds[:, i]
+        grads = tape.gradient(loss, conv_out)
+        pooled = tf.reduce_mean(tf.abs(grads), axis=(0, 1, 2))
+        c_out = conv_out[0]
+        hmap = c_out @ pooled[..., tf.newaxis]
+        hmap = tf.squeeze(hmap).numpy()
+
+        p5, p95 = np.percentile(hmap, 5), np.percentile(hmap, 95)
+        hmap = np.clip(hmap, p5, p95)
+        hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min() + 1e-8)
+        hmap = cv2.resize(hmap, (img_size, img_size), interpolation=cv2.INTER_LANCZOS4)
+        hmap = cv2.GaussianBlur(hmap, (15, 15), 0)
+
+        ax = axes[i]
+        ax.imshow(X_test[idx])
+        ax.imshow(hmap, cmap="jet", alpha=0.45)
+        ax.set_title(cname, fontsize=11, fontweight="bold", color=CLASS_COLORS[i % len(CLASS_COLORS)], pad=6)
+        ax.axis("off")
+        ax.set_facecolor("black")
+
+    plt.tight_layout(pad=1.5)
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "ASAM vs Grad-CAM Agreement Summary.txt" (v7)
+# ---------------------------------------------------------------------
+def get_asam_blended_map(model, img_array):
+    try:
+        target = model.get_layer("asam_global_attn")
+    except ValueError:
+        try:
+            target = model.get_layer("asam_blended_output")
+            print("  \u26a0\ufe0f  asam_global_attn nahi mili, asam_blended_output use ho rahi hai")
+        except ValueError:
+            target = None
+            for l in model.layers:
+                if isinstance(l, tf.keras.layers.Activation):
+                    target = l
+                    break
+    if target is None:
+        print("  \u26a0\ufe0f  ASAM layer nahi mili!")
+        return None
+
+    feat_model = tf.keras.Model(inputs=model.input, outputs=target.output)
+    features = feat_model(img_array, training=False)
+    feat_np = features.numpy()[0]
+    spatial = feat_np.mean(axis=-1)
+    spatial = np.maximum(spatial, 0)
+    spatial = spatial - spatial.min()
+    if spatial.max() > 1e-8:
+        spatial = spatial / spatial.max()
+    return spatial.astype(np.float32)
+
+
+def get_grad_cam_v4(model, img_array, class_idx):
+    try:
+        target_layer = model.get_layer("asam_global_attn")
+    except ValueError:
+        target_layer = None
+        for layer in reversed(model.layers):
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                target_layer = layer
+                break
+    if target_layer is None:
+        return None
+
+    grad_model = tf.keras.Model(inputs=model.input, outputs=[target_layer.output, model.output])
+    with tf.GradientTape() as tape:
+        conv_out, preds = grad_model(img_array, training=False)
+        loss = preds[:, class_idx]
+    grads = tape.gradient(loss, conv_out)
+    pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
+    cam = tf.reduce_sum(conv_out[0] * pooled[tf.newaxis, tf.newaxis, :], axis=-1).numpy()
+    cam = np.maximum(cam, 0)
+    cam = cam - cam.min()
+    if cam.max() > 1e-8:
+        cam = cam / cam.max()
+    return cam.astype(np.float32)
+
+
+def _resize_to_224(heatmap, h=224, w=224):
+    r = cv2.resize(heatmap, (w, h), interpolation=cv2.INTER_LINEAR)
+    r = r - r.min()
+    if r.max() > 1e-8:
+        r = r / r.max()
+    return r.astype(np.float32)
+
+
+def _make_overlay_v4(img, heatmap, cmap=cv2.COLORMAP_JET, alpha=0.50):
+    h, w = img.shape[:2]
+    hm = cv2.resize(heatmap, (w, h))
+    hm_color = cv2.applyColorMap(np.uint8(255 * hm), cmap)
+    hm_color = cv2.cvtColor(hm_color, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    overlay = alpha * hm_color + (1 - alpha) * img.astype(np.float32)
+    return np.clip(overlay, 0, 1)
+
+
+def _agreement_v4(a, b):
+    ag = np.sqrt(np.maximum(a, 0) * np.maximum(b, 0) + 1e-8)
+    ag = ag - ag.min()
+    if ag.max() > 1e-8:
+        ag = ag / ag.max()
+    return ag.astype(np.float32)
+
+
+def _correlations_v4(a, b):
+    p = float(np.corrcoef(a.flatten(), b.flatten())[0, 1])
+    s = float(spearmanr(a.flatten(), b.flatten()).statistic)
+    return p, s
+
+
+def plot_asam_vs_gradcam_agreement(best_model, X_test, y_test, y_pred, class_names):
+    class_sample_imgs, class_sample_labels = {}, {}
+    print("\n  Selecting best-agreement image per class...")
+
+    for cls_idx, cls_name in enumerate(class_names):
+        correct = np.where((y_test == cls_idx) & (y_pred == cls_idx))[0]
+        candidates = correct if len(correct) > 0 else np.where(y_test == cls_idx)[0]
+        candidates = candidates[:20]
+
+        best_idx, best_corr = candidates[0], -999.0
+        for idx in candidates:
+            img_in = np.expand_dims(X_test[idx], axis=0)
+            asam_raw = get_asam_blended_map(best_model, img_in)
+            gradcam_raw = get_grad_cam_v4(best_model, img_in, cls_idx)
+            if asam_raw is None or gradcam_raw is None:
+                continue
+            asam_224 = _resize_to_224(asam_raw)
+            gradcam_224 = _resize_to_224(gradcam_raw)
+            p, s = _correlations_v4(asam_224, gradcam_224)
+            avg = (p + s) / 2.0
+            if avg > best_corr:
+                best_corr, best_idx = avg, idx
+
+        class_sample_imgs[cls_name] = X_test[best_idx]
+        class_sample_labels[cls_name] = cls_idx
+        print(f"    {cls_name:<25} best r+\u03c1 avg = {best_corr:+.4f}  (idx={best_idx})")
+
+    n_classes = len(class_names)
+    col_titles = ["Original Image", "ASAM Global Attention\n(HOT colormap)", "Grad-CAM\n(JET colormap)",
+                  "Agreement Map\n(Geometric Mean)", "Activation Profile\n(Top \u2192 Bottom)"]
+
+    fig = plt.figure(figsize=(28, n_classes * 6.5))
+    fig.suptitle("ASAM Global Attention vs Grad-CAM — Same Image Comparison\n"
+                 "(Best-agreement correctly classified image shown per class)",
+                 fontsize=16, fontweight="bold", y=0.98)
+    gs = gridspec.GridSpec(n_classes, 5, figure=fig, hspace=0.35, wspace=0.08,
+                            left=0.06, right=0.99, top=0.93, bottom=0.02)
+
+    summary_results = []
+
+    for row_idx, cls_name in enumerate(class_names):
+        img = class_sample_imgs[cls_name]
+        cls_idx = class_sample_labels[cls_name]
+        img_in = np.expand_dims(img, axis=0)
+
+        asam_raw = get_asam_blended_map(best_model, img_in)
+        gradcam_raw = get_grad_cam_v4(best_model, img_in, cls_idx)
+        asam_224 = _resize_to_224(asam_raw)
+        gradcam_224 = _resize_to_224(gradcam_raw)
+        agree_224 = _agreement_v4(asam_224, gradcam_224)
+
+        asam_ov = _make_overlay_v4(img, asam_224, cv2.COLORMAP_HOT, 0.50)
+        gradcam_ov = _make_overlay_v4(img, gradcam_224, cv2.COLORMAP_JET, 0.50)
+        agree_ov = _make_overlay_v4(img, agree_224, cv2.COLORMAP_PLASMA, 0.55)
+
+        pearson, spearman = _correlations_v4(asam_224, gradcam_224)
+        summary_results.append((cls_name, pearson, spearman))
+
+        py_a, px_a = np.unravel_index(np.argmax(asam_224), asam_224.shape)
+        py_g, px_g = np.unravel_index(np.argmax(gradcam_224), gradcam_224.shape)
+        delta_peak = np.sqrt((px_a - px_g) ** 2 + (py_a - py_g) ** 2)
+
+        ax0 = fig.add_subplot(gs[row_idx, 0])
+        ax0.imshow(img)
+        ax0.set_ylabel(cls_name, fontsize=10, fontweight="bold", labelpad=8)
+        ax0.set_title(col_titles[0] if row_idx == 0 else "", fontsize=11, fontweight="bold")
+        ax0.axis("off")
+
+        ax1 = fig.add_subplot(gs[row_idx, 1])
+        ax1.imshow(asam_ov)
+        ax1.plot(px_a, py_a, "w*", ms=13, mec="black", mew=0.8)
+        ax1.set_title(col_titles[1] if row_idx == 0 else "", fontsize=11, fontweight="bold")
+        ax1.axis("off")
+
+        ax2 = fig.add_subplot(gs[row_idx, 2])
+        ax2.imshow(gradcam_ov)
+        ax2.plot(px_g, py_g, "w*", ms=13, mec="black", mew=0.8)
+        ax2.text(0.97, 0.03, f"\u0394peak={delta_peak:.0f}px", transform=ax2.transAxes, ha="right", va="bottom",
+                 fontsize=8, color="white", bbox=dict(boxstyle="round,pad=0.25", fc="#c0392b", alpha=0.85))
+        ax2.set_title(col_titles[2] if row_idx == 0 else "", fontsize=11, fontweight="bold")
+        ax2.axis("off")
+
+        ax3 = fig.add_subplot(gs[row_idx, 3])
+        ax3.imshow(agree_ov)
+        badge_color = "#27ae60" if pearson >= 0.55 else "#e67e22" if pearson >= 0.30 else "#c0392b"
+        ax3.text(0.97, 0.97, f"r  = {pearson:+.3f}\n\u03c1  = {spearman:+.3f}", transform=ax3.transAxes,
+                 ha="right", va="top", fontsize=9, fontweight="bold", color="white",
+                 bbox=dict(boxstyle="round,pad=0.35", fc=badge_color, alpha=0.90))
+        ax3.set_title(col_titles[3] if row_idx == 0 else "", fontsize=11, fontweight="bold")
+        ax3.axis("off")
+
+        ax4 = fig.add_subplot(gs[row_idx, 4])
+        asam_prof = asam_224.mean(axis=1)
+        gradcam_prof = gradcam_224.mean(axis=1)
+        y_ax = np.linspace(0, 1, 224)
+        ax4.plot(asam_prof, y_ax, color="#e74c3c", lw=2.2, label="ASAM", alpha=0.90)
+        ax4.plot(gradcam_prof, y_ax, color="#2980b9", lw=2.2, label="Grad-CAM", alpha=0.90, ls="--")
+        ax4.fill_betweenx(y_ax, np.minimum(asam_prof, gradcam_prof), np.maximum(asam_prof, gradcam_prof),
+                           alpha=0.20, color="#8e44ad")
+        ax4.invert_yaxis()
+        ax4.set_xlim(0, 1.05)
+        ax4.set_ylim(1, 0)
+        ax4.set_title(col_titles[4] if row_idx == 0 else "", fontsize=11, fontweight="bold")
+        ax4.set_xlabel("Activation", fontsize=8)
+        ax4.set_ylabel("Spatial Position", fontsize=8)
+        ax4.tick_params(labelsize=7)
+        ax4.spines[["top", "right"]].set_visible(False)
+        ax4.grid(axis="x", ls="--", alpha=0.30)
+        if row_idx == 0:
+            ax4.legend(fontsize=8, loc="lower right")
+
+    print("\n" + "=" * 70)
+    print("ASAM vs Grad-CAM Agreement Summary (v7 — Best Agreement Image Per Class)")
+    print("=" * 70)
+    print(f"  {'Class':<25} {'Pearson r':>10} {'Spearman \u03c1':>11}  {'Interpretation'}")
+    print(f"  {'-'*66}")
+    for cls_name, p, s in summary_results:
+        avg = (p + s) / 2
+        interp = ("Strong Agreement" if avg >= 0.55 else
+                  "Moderate Agreement" if avg >= 0.30 else "Weak Agreement")
+        print(f"  {cls_name:<25} {p:>+10.4f} {s:>+11.4f}  {interp}")
+
+    return fig, summary_results
+
+
+# ---------------------------------------------------------------------
+# "T-SNE FEATURE EMBEDDING.txt"
+# ---------------------------------------------------------------------
+def plot_tsne(best_model, X_test, y_test, class_names, seed: int = 42):
+    gap_layer = [l.name for l in best_model.layers
+                 if isinstance(l, tf.keras.layers.GlobalAveragePooling2D)][0]
+    feat_extractor = models.Model(inputs=best_model.input, outputs=best_model.get_layer(gap_layer).output)
+
+    print("Extracting CNN features for t-SNE...")
+    features = feat_extractor.predict(X_test, verbose=1)
+
+    print("Applying t-SNE (this may take a minute)...")
+    tsne = TSNE(n_components=2, random_state=seed, perplexity=min(30, len(X_test) - 1))
+    tsne_feats = tsne.fit_transform(features)
+
+    fig, ax = plt.subplots(figsize=(11, 8))
+    tsne_colors = ["#3498db", "#2ecc71", "#e74c3c", "#9b59b6"]
+    for ci, cname in enumerate(class_names):
+        mask = y_test == ci
+        ax.scatter(tsne_feats[mask, 0], tsne_feats[mask, 1], c=tsne_colors[ci % len(tsne_colors)],
+                   label=cname, alpha=0.75, edgecolors="white", linewidths=0.5, s=60)
+
+    ax.set_title("t-SNE Feature Embedding — CNN Extracted Features", fontsize=15, fontweight="bold")
+    ax.set_xlabel("t-SNE Dimension 1", fontsize=12)
+    ax.set_ylabel("t-SNE Dimension 2", fontsize=12)
+    ax.legend(fontsize=11, markerscale=1.4)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(linestyle="--", alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+"""
+ASAM-CNN architecture: a lightweight CNN backbone integrated with the
+multi-component Adaptive Self-Attention Module (ASAM), consisting of:
+
+  1. AdaptiveScaleLayer      -- per-image, per-channel input scaling
+                                  learned from GAP + GMP + std feature statistics.
+  2. DynamicTemperatureLayer -- per-image softmax temperature for the
+                                  self-attention map (controls sharpness).
+  3. Dual-Path Local-Global Blending -- combines a global self-attention
+                                  path with a local depthwise-conv path,
+                                  blended via a learned per-channel alpha.
+
+These make the attention truly input-dependent, unlike fixed/generic
+attention modules that apply the same pattern to every image.
+"""
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, regularizers
+
+
+class AdaptiveScaleLayer(layers.Layer):
+    """Input-dependent adaptive channel scaling.
+
+    Computes a per-image, per-channel scale factor from the input's own
+    feature statistics (global average + global max + std), rather than
+    using a fixed learned gamma.
+    """
+
+    def build(self, input_shape):
+        c = input_shape[-1]
+        self.dense1 = layers.Dense(max(c // 8, 1), activation="relu")
+        self.dense2 = layers.Dense(c, activation="sigmoid")
+        self.gap = layers.GlobalAveragePooling2D()
+        self.gmp = layers.GlobalMaxPooling2D()
+
+    def call(self, x):
+        avg = self.gap(x)                                    # (B, C)
+        mx = self.gmp(x)                                      # (B, C)
+        std = tf.math.reduce_std(
+            tf.reshape(x, [tf.shape(x)[0], -1, x.shape[-1]]), axis=1
+        )                                                      # (B, C)
+        stats = avg + mx + std
+        scale = self.dense2(self.dense1(stats))
+        scale = tf.reshape(scale, [-1, 1, 1, x.shape[-1]])
+        return x * scale
+
+
+class DynamicTemperatureLayer(layers.Layer):
+    """Per-image dynamic softmax temperature for self-attention.
+
+    Low temperature -> sharper/more focused attention.
+    High temperature -> softer/more uniform attention.
+    The model learns when to focus vs. distribute attention, per image.
+    """
+
+    def build(self, input_shape):
+        c = input_shape[-1]
+        self.gap = layers.GlobalAveragePooling2D()
+        self.dense1 = layers.Dense(max(c // 16, 1), activation="relu")
+        self.dense2 = layers.Dense(1, activation="softplus")  # always > 0
+
+    def call(self, x):
+        t = self.gap(x)
+        t = self.dense2(self.dense1(t))                       # (B, 1)
+        t = tf.clip_by_value(t, 0.1, 10.0)
+        t = tf.reshape(t, [-1, 1, 1])
+        return t
+
+
+CUSTOM_OBJECTS = {
+    "AdaptiveScaleLayer": AdaptiveScaleLayer,
+    "DynamicTemperatureLayer": DynamicTemperatureLayer,
+}
+
+
+def channel_attention(x):
+    """CBAM-style channel attention (unchanged from standard formulation)."""
+    channels = x.shape[-1]
+    avg = layers.GlobalAveragePooling2D()(x)
+    maxp = layers.GlobalMaxPooling2D()(x)
+    dense1 = layers.Dense(channels // 16, activation="relu")
+    dense2 = layers.Dense(channels, activation="sigmoid")
+    avg = dense2(dense1(avg))
+    maxp = dense2(dense1(maxp))
+    scale = layers.Add()([avg, maxp])
+    scale = layers.Reshape((1, 1, channels))(scale)
+    return layers.Multiply()([x, scale])
+
+
+def adaptive_self_attention(x, l2_weight: float = 1e-4):
+    """The ASAM module: adaptive scaling + dynamic-temperature self-attention
+    + dual-path (global attention / local depthwise conv) blending.
+    """
+    channels = x.shape[-1]
+    h = x.shape[1]
+    w = x.shape[2]
+    hw = h * w
+    d_k = max(channels // 32, 1)
+
+    # STEP 1: Adaptive Input Scaling
+    x_scaled = AdaptiveScaleLayer()(x)
+
+    # STEP 2: Q, K, V Projections
+    q = layers.Conv2D(d_k, 1, padding="same",
+                       kernel_regularizer=regularizers.l2(l2_weight))(x_scaled)
+    k = layers.Conv2D(d_k, 1, padding="same",
+                       kernel_regularizer=regularizers.l2(l2_weight))(x_scaled)
+    v = layers.Conv2D(channels, 1, padding="same",
+                       kernel_regularizer=regularizers.l2(l2_weight))(x_scaled)
+
+    q_flat = layers.Reshape((hw, d_k))(q)
+    k_flat = layers.Reshape((hw, d_k))(k)
+    v_flat = layers.Reshape((hw, channels))(v)
+
+    # STEP 3: Dynamic Temperature Scaling
+    temp = DynamicTemperatureLayer()(x_scaled)                # (B, 1, 1)
+
+    scale_factor = tf.cast(tf.math.sqrt(float(d_k)), tf.float32)
+    attn_logits = layers.Dot(axes=[2, 2])([q_flat, k_flat])   # (B, HW, HW)
+    attn_logits = attn_logits / (temp * scale_factor)
+
+    attn_map = layers.Softmax()(attn_logits)
+
+    out = layers.Dot(axes=[2, 1])([attn_map, v_flat])
+    out = layers.Reshape((h, w, channels))(out)
+    out = layers.Conv2D(channels, 1, padding="same",
+                         kernel_regularizer=regularizers.l2(l2_weight))(out)
+
+    # STEP 4: Dual-Path -- Local + Global
+    local = layers.DepthwiseConv2D(
+        3, padding="same",
+        depthwise_regularizer=regularizers.l2(l2_weight)
+    )(x_scaled)
+    local = layers.BatchNormalization()(local)
+    local = layers.ReLU()(local)
+
+    alpha_in = layers.GlobalAveragePooling2D()(x_scaled)
+    alpha = layers.Dense(channels, activation="sigmoid")(alpha_in)
+    alpha = layers.Reshape((1, 1, channels))(alpha)
+
+    blended = (alpha * out) + ((1.0 - alpha) * local)
+
+    # STEP 5: Residual Connection
+    return layers.Add()([x, blended])
+
+
+def build_model(img_size: int = 224, num_classes: int = 4, l2_weight: float = 1e-4):
+    """Build and compile the ASAM-CNN model."""
+    inputs = layers.Input(shape=(img_size, img_size, 3))
+    x = layers.RandomFlip("horizontal")(inputs)
+    x = layers.RandomFlip("vertical")(x)
+    x = layers.RandomRotation(0.01)(x)
+    x = layers.RandomZoom(0.01)(x)
+    x = layers.RandomContrast(0.01)(x)
+
+    for filters in (32, 64, 128, 256):
+        x = layers.Conv2D(filters, 3, padding="same",
+                           kernel_regularizer=regularizers.l2(l2_weight))(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        x = layers.MaxPooling2D()(x)
+
+    x = adaptive_self_attention(x, l2_weight=l2_weight)
+    x = channel_attention(x)
+
+    # Residual block
+    shortcut = x
+    x = layers.Conv2D(256, 3, padding="same",
+                       kernel_regularizer=regularizers.l2(l2_weight))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    x = layers.Conv2D(256, 3, padding="same",
+                       kernel_regularizer=regularizers.l2(l2_weight))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    x = layers.Conv2D(256, 3, padding="same",
+                       kernel_regularizer=regularizers.l2(l2_weight))(x)
+    x = layers.BatchNormalization()(x)
+    shortcut = layers.Conv2D(256, 1, padding="same",
+                              kernel_regularizer=regularizers.l2(l2_weight))(shortcut)
+    shortcut = layers.BatchNormalization()(shortcut)
+    x = layers.Add()([x, shortcut])
+    x = layers.ReLU()(x)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(128, activation="relu")(x)
+    x = layers.Dropout(0.8)(x)
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+
+    model = models.Model(inputs, outputs)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-4),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model
+"""
+Domain-specific preprocessing pipeline for otoscopic images:
+circular cropping (isolates the circular otoscope field of view)
++ CLAHE contrast enhancement on the L channel (LAB color space).
+"""
+
+import cv2
+import numpy as np
+
+
+def circular_crop(img: np.ndarray) -> np.ndarray:
+    """Mask everything outside the circular otoscope field of view."""
+    h, w = img.shape[:2]
+    center = (w // 2, h // 2)
+    radius = min(center)
+    mask = np.zeros((h, w), np.uint8)
+    cv2.circle(mask, center, radius, 255, -1)
+    return cv2.bitwise_and(img, img, mask=mask)
+
+
+def apply_clahe_rgb(img: np.ndarray) -> np.ndarray:
+    """Apply CLAHE to the L channel in LAB space, then convert back to RGB."""
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+
+def preprocess(path: str, img_size: int = 224) -> np.ndarray:
+    """Load an image from disk and apply the full preprocessing pipeline.
+
+    Steps: BGR->RGB -> circular crop -> resize -> CLAHE -> scale to [0, 1].
+    """
+    img = cv2.imread(path)
+    if img is None:
+        raise ValueError(f"Cannot read image: {path}")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = circular_crop(img)
+    img = cv2.resize(img, (img_size, img_size))
+    img = apply_clahe_rgb(img)
+    return (img / 255.0).astype(np.float32)
+"""
+Loads the training data, runs 5-fold stratified cross-validation,
+and saves the best checkpoint per fold.
+
+Usage:
+    python -m src.train --config configs/config.yaml
+"""
+
+import argparse
+import os
+
+import numpy as np
+import tensorflow as tf
+import yaml
+from sklearn.metrics import f1_score
+from sklearn.model_selection import StratifiedKFold
+from tensorflow.keras.utils import to_categorical
+
+from .model import build_model
+from .preprocess import preprocess
+from .utils import set_seed, configure_gpu, find_dataset_root
+
+
+def get_callbacks(ckpt_path: str):
+    return [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=ckpt_path, monitor="val_loss", save_best_only=True, verbose=0
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=1
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=15, restore_best_weights=True, verbose=1
+        ),
+    ]
+
+
+def load_class_folder(base_dir: str, class_names, img_size: int):
+    X, y = [], []
+    class_to_index = {name: i for i, name in enumerate(class_names)}
+    for cname in class_names:
+        folder = os.path.join(base_dir, cname)
+        for fname in sorted(os.listdir(folder)):
+            X.append(preprocess(os.path.join(folder, fname), img_size=img_size))
+            y.append(class_to_index[cname])
+    return np.array(X, dtype=np.float32), np.array(y)
+
+
+def run_cross_validation(cfg: dict):
+    set_seed(cfg["seed"])
+    configure_gpu()
+
+    dataset_root = find_dataset_root(cfg["paths"]["input_root"])
+    train_dir = os.path.join(dataset_root, "Training-validation")
+
+    class_names = sorted(
+        d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))
+    )
+    num_classes = len(class_names)
+    print("Classes:", class_names)
+
+    img_size = cfg["img_size"]
+    X, y = load_class_folder(train_dir, class_names, img_size)
+    print("Total training images:", len(X))
+    for i, c in enumerate(class_names):
+        print(f"  {c}: {np.sum(y == i)}")
+
+    y_cat = to_categorical(y)
+    ckpt_dir = cfg["paths"]["checkpoint_dir"]
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    skf = StratifiedKFold(n_splits=cfg["n_folds"], shuffle=True, random_state=cfg["seed"])
+
+    cv_acc, cv_f1, cv_history, fold_ckpts = [], [], [], []
+    best_fold_f1, best_ckpt = 0.0, None
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), 1):
+        print(f"\n===== Fold {fold} / {cfg['n_folds']} =====")
+        print(f"  Train: {len(train_idx)}  Val: {len(val_idx)}")
+
+        model = build_model(img_size=img_size, num_classes=num_classes, l2_weight=cfg["l2_weight"])
+        ckpt_path = os.path.join(ckpt_dir, f"fold_{fold}.keras")
+
+        history = model.fit(
+            X[train_idx], y_cat[train_idx],
+            validation_data=(X[val_idx], y_cat[val_idx]),
+            epochs=cfg["epochs"],
+            batch_size=cfg["batch_size"],
+            callbacks=get_callbacks(ckpt_path),
+            verbose=1,
+        )
+        cv_history.append(history.history)
+
+        from .model import CUSTOM_OBJECTS
+        model = tf.keras.models.load_model(ckpt_path, custom_objects=CUSTOM_OBJECTS)
+        preds = model.predict(X[val_idx], verbose=0)
+        classes = np.argmax(preds, axis=1)
+
+        acc = np.mean(classes == y[val_idx])
+        f1 = f1_score(y[val_idx], classes, average="macro")
+        print(f"  Fold {fold} Accuracy: {acc:.4f}  F1: {f1:.4f}")
+
+        cv_acc.append(acc)
+        cv_f1.append(f1)
+        fold_ckpts.append(ckpt_path)
+        if f1 > best_fold_f1:
+            best_fold_f1, best_ckpt = f1, ckpt_path
+
+    print(f"\nMean Accuracy : {np.mean(cv_acc):.4f} +/- {np.std(cv_acc):.4f}")
+    print(f"Mean F1       : {np.mean(cv_f1):.4f} +/- {np.std(cv_f1):.4f}")
+
+    return {
+        "class_names": class_names,
+        "cv_acc": cv_acc,
+        "cv_f1": cv_f1,
+        "cv_history": cv_history,
+        "fold_ckpts": fold_ckpts,
+        "best_ckpt": best_ckpt,
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/config.yaml")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    run_cross_validation(cfg)
+"""Shared utilities: reproducibility seeding, dataset auto-discovery,
+figure auto-save on plt.show(), and zipping figures for download.
+"""
+
+import os
+import random
+import zipfile
+
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+
+def set_seed(seed: int = 42):
+    """Fix all relevant RNG seeds for reproducibility."""
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    tf.random.set_seed(seed)
+
+
+def configure_gpu():
+    """Enable memory growth on any available GPU (avoids TF grabbing all VRAM)."""
+    gpus = tf.config.experimental.list_physical_devices("GPU")
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+
+def find_dataset_root(input_root: str = "/kaggle/input") -> str:
+    """Auto-detect the dataset folder containing 'Training-validation' and
+    'Testing' subfolders (searches recursively under input_root).
+    """
+    for dataset in os.listdir(input_root):
+        dataset_path = os.path.join(input_root, dataset)
+        for root, dirs, _ in os.walk(dataset_path):
+            if "Training-validation" in dirs and "Testing" in dirs:
+                return root
+    raise RuntimeError(
+        "Dataset not found. Expected 'Training-validation' and 'Testing' folders "
+        f"somewhere under {input_root}."
+    )
+
+
+def enable_figure_autosave(save_dir: str = "/kaggle/working/figures"):
+    """Monkey-patch plt.show() to also save each figure as a numbered PNG."""
+    os.makedirs(save_dir, exist_ok=True)
+    counter = {"count": 0}
+    original_show = plt.show
+
+    def auto_save_show(*args, **kwargs):
+        counter["count"] += 1
+        path = os.path.join(save_dir, f"figure_{counter['count']:02d}.png")
+        plt.savefig(path, dpi=300, bbox_inches="tight")
+        print(f"Saved: {path}")
+        original_show(*args, **kwargs)
+
+    plt.show = auto_save_show
+
+
+def zip_figures(figures_dir: str, zip_path: str):
+    """Zip every PNG found under figures_dir into a single archive."""
+    png_files = []
+    for root, _, files in os.walk(figures_dir):
+        for f in files:
+            if f.endswith(".png"):
+                png_files.append(os.path.join(root, f))
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for fpath in png_files:
+            zipf.write(fpath, arcname=os.path.basename(fpath))
+            print(f"  Added: {os.path.basename(fpath)}")
+
+    size_mb = os.path.getsize(zip_path) / 1024 / 1024
+    print(f"\nZIP ready: {zip_path} ({size_mb:.2f} MB, {len(png_files)} figures)")
+    return zip_path
+"""
+Dataset / training / evaluation visualizations.
+
+Every function here is a faithful, function-wrapped port of the
+corresponding script in the original Zenodo.rar export (filenames noted
+in each docstring). No behavior was changed beyond turning module-level
+script code into parameterized functions and returning the figure
+instead of hard-coding plt.show()/plt.savefig().
+"""
+
+import os
+
+import cv2
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from tensorflow.keras import layers
+from sklearn.metrics import (confusion_matrix, precision_score, recall_score,
+                              f1_score, roc_curve, auc)
+from sklearn.preprocessing import label_binarize
+
+CLASS_COLORS = ["#2ecc71", "#3498db", "#e74c3c", "#9b59b6"]
+FOLD_COLORS = ["#3498db", "#2ecc71", "#e74c3c", "#9b59b6", "#f39c12"]
+
+
+# ---------------------------------------------------------------------
+# "SAMPLE TYMPANIC MEMBRANE IMAGES.txt"
+# ---------------------------------------------------------------------
+def plot_sample_images(train_dir, class_names, img_size: int = 224, samples_per_class: int = 4):
+    fig, axes = plt.subplots(len(class_names), samples_per_class,
+                              figsize=(samples_per_class * 3.5, len(class_names) * 3.5))
+    fig.suptitle("Sample Tympanic Membrane Images", fontsize=16, fontweight="bold", y=1.01)
+
+    for ci, cname in enumerate(class_names):
+        folder = os.path.join(train_dir, cname)
+        files = sorted(os.listdir(folder))[:samples_per_class]
+        for si, fname in enumerate(files):
+            ax = axes[ci][si]
+            img = cv2.imread(os.path.join(folder, fname))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (img_size, img_size))
+            ax.imshow(img)
+            ax.axis("off")
+            if si == 0:
+                ax.set_ylabel(cname, fontsize=12, fontweight="bold",
+                               color=CLASS_COLORS[ci % len(CLASS_COLORS)], rotation=90, labelpad=8)
+            if ci == 0:
+                ax.set_title(f"Sample {si+1}", fontsize=11, fontweight="bold")
+            for spine in ax.spines.values():
+                spine.set_edgecolor(CLASS_COLORS[ci % len(CLASS_COLORS)])
+                spine.set_linewidth(2.5)
+                spine.set_visible(True)
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "PREPROCESSING PIPELINE VISUALIZATION.txt"
+# ---------------------------------------------------------------------
+def plot_preprocessing_pipeline(train_dir, class_names, circular_crop_fn, clahe_fn,
+                                 img_size: int = 224, samples_per_class: int = 4):
+    pipeline_steps = ["Original", "Circular Crop", f"Resized ({img_size}x{img_size})", "CLAHE Enhanced"]
+    n_rows = len(class_names) * samples_per_class
+
+    fig, axes = plt.subplots(n_rows, len(pipeline_steps),
+                              figsize=(len(pipeline_steps) * 3.5, n_rows * 3.2))
+    fig.suptitle("Preprocessing Pipeline Visualization", fontsize=16, fontweight="bold", y=1.005)
+
+    row = 0
+    for ci, cname in enumerate(class_names):
+        folder = os.path.join(train_dir, cname)
+        files = sorted(os.listdir(folder))[:samples_per_class]
+        for si, fname in enumerate(files):
+            img = cv2.imread(os.path.join(folder, fname))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            step0 = img.copy()
+            step1 = circular_crop_fn(img.copy())
+            step2 = cv2.resize(step1, (img_size, img_size))
+            step3 = clahe_fn(step2.copy())
+
+            for col, (step_img, step_name) in enumerate(zip([step0, step1, step2, step3], pipeline_steps)):
+                ax = axes[row][col]
+                ax.imshow(step_img)
+                ax.axis("off")
+                if col == 0:
+                    ax.set_ylabel(f"{cname}\nImg {si+1}", fontsize=9, fontweight="bold",
+                                   color=CLASS_COLORS[ci % len(CLASS_COLORS)])
+                if row == 0:
+                    ax.set_title(step_name, fontsize=11, fontweight="bold", pad=6)
+            row += 1
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "DATA AUGMENTATION EFFECT.txt"
+# ---------------------------------------------------------------------
+def plot_augmentation_effects(train_dir, class_names, preprocess_fn, samples_per_class: int = 4):
+    def apply_aug_np(img_np, aug_layer):
+        t = tf.expand_dims(tf.cast(img_np, tf.float32), 0)
+        out = aug_layer(t, training=True)
+        return out[0].numpy()
+
+    aug_techniques = {
+        "Original": None,
+        "Horizontal Flip": layers.RandomFlip("horizontal"),
+        "Vertical Flip": layers.RandomFlip("vertical"),
+        "Random Rotation": layers.RandomRotation(0.1),
+        "Random Zoom": layers.RandomZoom(0.1),
+        "Random Contrast": layers.RandomContrast(0.1),
+    }
+    aug_names = list(aug_techniques.keys())
+    n_augs = len(aug_names)
+
+    figs = []
+    for ci, cname in enumerate(class_names):
+        folder = os.path.join(train_dir, cname)
+        files = sorted(os.listdir(folder))[:samples_per_class]
+
+        fig, axes = plt.subplots(samples_per_class, n_augs,
+                                  figsize=(n_augs * 3.2, samples_per_class * 3.2))
+        fig.suptitle(f"Data Augmentation Effect — Class: {cname}", fontsize=14, fontweight="bold")
+
+        for si, fname in enumerate(files):
+            img_raw = preprocess_fn(os.path.join(folder, fname))  # already float32 [0,1]
+            for ai, aug_name in enumerate(aug_names):
+                ax = axes[si][ai]
+                aug_layer = aug_techniques[aug_name]
+                disp = img_raw if aug_layer is None else np.clip(apply_aug_np(img_raw, aug_layer), 0, 1)
+                ax.imshow(disp)
+                ax.axis("off")
+                if si == 0:
+                    ax.set_title(aug_name, fontsize=9, fontweight="bold")
+                if ai == 0:
+                    ax.set_ylabel(f"Img {si+1}", fontsize=9, fontweight="bold",
+                                   color=CLASS_COLORS[ci % len(CLASS_COLORS)])
+        plt.tight_layout()
+        figs.append(fig)
+    return figs
+
+
+# ---------------------------------------------------------------------
+# "DATASET CLASS DISTRIBUTION.txt"
+# ---------------------------------------------------------------------
+def plot_class_distribution(y_train, y_test, class_names):
+    num_classes = len(class_names)
+    train_counts = [np.sum(y_train == i) for i in range(num_classes)]
+    test_counts = [np.sum(y_test == i) for i in range(num_classes)]
+
+    x_pos = np.arange(num_classes)
+    width = 0.35
+    colors_train = ["#2ecc71", "#3498db", "#e74c3c", "#9b59b6"]
+    colors_test = ["#27ae60", "#2980b9", "#c0392b", "#8e44ad"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle("Dataset Class Distribution", fontsize=16, fontweight="bold")
+
+    ax = axes[0]
+    bars1 = ax.bar(x_pos - width / 2, train_counts, width, label="Train",
+                    color=colors_train, edgecolor="white", linewidth=1.2)
+    bars2 = ax.bar(x_pos + width / 2, test_counts, width, label="Test",
+                    color=colors_test, edgecolor="white", linewidth=1.2, alpha=0.75)
+    for bar in bars1:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                str(int(bar.get_height())), ha="center", va="bottom", fontsize=10, fontweight="bold")
+    for bar in bars2:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                str(int(bar.get_height())), ha="center", va="bottom", fontsize=10, fontweight="bold")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(class_names, rotation=15, ha="right", fontsize=11)
+    ax.set_ylabel("Number of Images", fontsize=12)
+    ax.set_title("Images Per Class (Train vs Test)", fontsize=13)
+    ax.legend(fontsize=11)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+    ax2 = axes[1]
+    total_per_class = [t + v for t, v in zip(train_counts, test_counts)]
+    wedges, texts, autotexts = ax2.pie(
+        total_per_class, labels=class_names, colors=["#2ecc71", "#3498db", "#e74c3c", "#9b59b6"],
+        autopct="%1.1f%%", startangle=140, pctdistance=0.82,
+        wedgeprops=dict(width=0.6, edgecolor="white", linewidth=2))
+    for t in autotexts:
+        t.set_fontsize(11)
+        t.set_fontweight("bold")
+    ax2.set_title("Overall Class Distribution (Total)", fontsize=13)
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "5-FOLD CROSS VALIDATION ACCURACY.txt" / "...F1 SCORE.txt"
+# ---------------------------------------------------------------------
+def plot_cv_bar(values, metric_name: str, n_folds: int):
+    folds = list(range(1, n_folds + 1))
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bars = ax.bar(folds, values, color=FOLD_COLORS[:n_folds], edgecolor="white", linewidth=1.5, zorder=3)
+    mean_v, std_v = np.mean(values), np.std(values)
+    ax.axhline(mean_v, color="#2c3e50", linestyle="--", linewidth=2, label=f"Mean = {mean_v:.4f}", zorder=4)
+    ax.fill_between([0.5, n_folds + 0.5], mean_v - std_v, mean_v + std_v, alpha=0.12, color="#2c3e50", zorder=2)
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.002,
+                f"{val:.4f}", ha="center", va="bottom", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Fold", fontsize=13)
+    ax.set_ylabel(metric_name, fontsize=13)
+    ax.set_title(f"5-Fold Cross Validation {metric_name}", fontsize=15, fontweight="bold")
+    ax.set_xticks(folds)
+    ax.set_xticklabels([f"Fold {f}" for f in folds], fontsize=11)
+    ax.set_ylim(max(0, min(values) - 0.05), 1.02)
+    ax.legend(fontsize=11)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=1)
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "LEARNING CURVES (per fold).txt"
+# ---------------------------------------------------------------------
+def plot_learning_curves(cv_history, n_folds: int):
+    fig, axes = plt.subplots(n_folds, 2, figsize=(14, n_folds * 3.5))
+    fig.suptitle("Learning Curves (Per Fold)", fontsize=16, fontweight="bold")
+
+    for fi, hist in enumerate(cv_history):
+        ep = range(1, len(hist["loss"]) + 1)
+
+        ax_loss = axes[fi][0]
+        ax_loss.plot(ep, hist["loss"], color="#3498db", linewidth=2, label="Train Loss")
+        ax_loss.plot(ep, hist["val_loss"], color="#e74c3c", linewidth=2, linestyle="--", label="Val Loss")
+        ax_loss.set_title(f"Fold {fi+1} — Loss", fontsize=11, fontweight="bold")
+        ax_loss.set_xlabel("Epoch")
+        ax_loss.set_ylabel("Loss")
+        ax_loss.legend(fontsize=9)
+        ax_loss.spines[["top", "right"]].set_visible(False)
+        ax_loss.grid(linestyle="--", alpha=0.4)
+
+        ax_acc = axes[fi][1]
+        ax_acc.plot(ep, hist["accuracy"], color="#2ecc71", linewidth=2, label="Train Acc")
+        ax_acc.plot(ep, hist["val_accuracy"], color="#9b59b6", linewidth=2, linestyle="--", label="Val Acc")
+        ax_acc.set_title(f"Fold {fi+1} — Accuracy", fontsize=11, fontweight="bold")
+        ax_acc.set_xlabel("Epoch")
+        ax_acc.set_ylabel("Accuracy")
+        ax_acc.legend(fontsize=9)
+        ax_acc.spines[["top", "right"]].set_visible(False)
+        ax_acc.grid(linestyle="--", alpha=0.4)
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "CONFUSION MATRIX.txt"
+# ---------------------------------------------------------------------
+def plot_confusion_matrix(y_test, y_pred, class_names):
+    num_classes = len(class_names)
+    cm = confusion_matrix(y_test, y_pred)
+    cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle("Confusion Matrix", fontsize=16, fontweight="bold")
+
+    for ax_idx, (data, title, fmt) in enumerate([(cm, "Raw Counts", "d"), (cm_norm, "Normalized (%)", ".2f")]):
+        ax = axes[ax_idx]
+        im = ax.imshow(data, interpolation="nearest", cmap="Blues" if ax_idx == 0 else "RdYlGn")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        thresh = data.max() / 2.0
+        for i in range(num_classes):
+            for j in range(num_classes):
+                val = f"{data[i,j]:{fmt}}" if fmt == "d" else f"{data[i,j]*100:.1f}%"
+                ax.text(j, i, val, ha="center", va="center", fontsize=11, fontweight="bold",
+                        color="white" if data[i, j] > thresh else "black")
+        ax.set_xticks(range(num_classes))
+        ax.set_yticks(range(num_classes))
+        ax.set_xticklabels(class_names, rotation=30, ha="right", fontsize=10)
+        ax.set_yticklabels(class_names, fontsize=10)
+        ax.set_xlabel("Predicted Label", fontsize=12)
+        ax.set_ylabel("True Label", fontsize=12)
+        ax.set_title(title, fontsize=13, fontweight="bold")
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "PRECISION  RECALL  F1 PER CLASS.txt"
+# ---------------------------------------------------------------------
+def plot_precision_recall_f1(y_test, y_pred, class_names):
+    num_classes = len(class_names)
+    precision_per = precision_score(y_test, y_pred, average=None)
+    recall_per = recall_score(y_test, y_pred, average=None)
+    f1_per = f1_score(y_test, y_pred, average=None)
+
+    x_pos = np.arange(num_classes)
+    width = 0.26
+    fig, ax = plt.subplots(figsize=(13, 6))
+    bars_sets = [
+        ax.bar(x_pos - width, precision_per, width, label="Precision", color="#3498db", edgecolor="white", linewidth=1.2),
+        ax.bar(x_pos, recall_per, width, label="Recall", color="#2ecc71", edgecolor="white", linewidth=1.2),
+        ax.bar(x_pos + width, f1_per, width, label="F1 Score", color="#e74c3c", edgecolor="white", linewidth=1.2),
+    ]
+    for bars in bars_sets:
+        for bar in bars:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                    f"{bar.get_height():.3f}", ha="center", va="bottom", fontsize=8.5, fontweight="bold")
+
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(class_names, rotation=15, ha="right", fontsize=11)
+    ax.set_ylabel("Score", fontsize=13)
+    ax.set_ylim(0, 1.12)
+    ax.set_title("Precision / Recall / F1 Score Per Class", fontsize=15, fontweight="bold")
+    ax.legend(fontsize=11, loc="lower right")
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+
+    print(f"{'Class':<25} {'Precision':>10} {'Recall':>10} {'F1':>10}")
+    for i, cname in enumerate(class_names):
+        print(f"{cname:<25} {precision_per[i]:>10.4f} {recall_per[i]:>10.4f} {f1_per[i]:>10.4f}")
+    print(f"{'Macro Average':<25} {np.mean(precision_per):>10.4f} {np.mean(recall_per):>10.4f} {np.mean(f1_per):>10.4f}")
+
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "ROC CURVES (MULTI-CLASS).txt"
+# ---------------------------------------------------------------------
+def plot_roc_curves(y_test, y_pred_proba, class_names):
+    num_classes = len(class_names)
+    y_test_bin = label_binarize(y_test, classes=list(range(num_classes)))
+    roc_colors = ["#3498db", "#2ecc71", "#e74c3c", "#9b59b6"]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for i, cname in enumerate(class_names):
+        fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_pred_proba[:, i])
+        roc_auc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, color=roc_colors[i % len(roc_colors)], linewidth=2.5,
+                label=f"{cname} (AUC = {roc_auc:.4f})")
+
+    all_fpr = np.unique(np.concatenate(
+        [roc_curve(y_test_bin[:, i], y_pred_proba[:, i])[0] for i in range(num_classes)]))
+    mean_tpr = np.zeros_like(all_fpr)
+    for i in range(num_classes):
+        fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_pred_proba[:, i])
+        mean_tpr += np.interp(all_fpr, fpr, tpr)
+    mean_tpr /= num_classes
+    macro_auc = auc(all_fpr, mean_tpr)
+    ax.plot(all_fpr, mean_tpr, color="#2c3e50", linewidth=3, linestyle="--",
+            label=f"Macro Average (AUC = {macro_auc:.4f})")
+
+    ax.plot([0, 1], [0, 1], color="gray", linewidth=1.5, linestyle=":")
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.05])
+    ax.set_xlabel("False Positive Rate", fontsize=13)
+    ax.set_ylabel("True Positive Rate", fontsize=13)
+    ax.set_title("ROC Curves (Multi-Class)", fontsize=15, fontweight="bold")
+    ax.legend(loc="lower right", fontsize=11)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "MISCLASSIFIED TYMPANIC MEMBRANE IMAGES.txt"
+# ---------------------------------------------------------------------
+def plot_misclassified_images(X_test, y_test, y_pred, y_pred_proba, class_names, n_show: int = 16):
+    misclassified_idx = np.where(y_pred != y_test)[0]
+    print(f"\nTotal misclassified: {len(misclassified_idx)} / {len(y_test)}")
+
+    n_show = min(n_show, len(misclassified_idx))
+    if n_show == 0:
+        print("No misclassified images — nothing to plot.")
+        return None
+
+    ncols = 4
+    nrows = (n_show + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.5, nrows * 3.8))
+    fig.suptitle("Misclassified Tympanic Membrane Images", fontsize=15, fontweight="bold")
+    axes = np.atleast_2d(axes)
+
+    for idx_show, idx in enumerate(misclassified_idx[:n_show]):
+        ax = axes[idx_show // ncols][idx_show % ncols]
+        img_mis = X_test[idx]
+        true_l = class_names[y_test[idx]]
+        pred_l = class_names[y_pred[idx]]
+        conf = y_pred_proba[idx][y_pred[idx]]
+        ax.imshow(img_mis)
+        ax.set_title(f"True: {true_l}\nPred: {pred_l} ({conf:.2f})",
+                     fontsize=8.5, fontweight="bold", color="#e74c3c")
+        ax.axis("off")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#e74c3c")
+            spine.set_linewidth(2.5)
+            spine.set_visible(True)
+
+    for idx_show in range(n_show, nrows * ncols):
+        axes[idx_show // ncols][idx_show % ncols].axis("off")
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "MODEL ACCURACY SUMMARY.txt"
+# ---------------------------------------------------------------------
+def plot_model_accuracy_summary(cv_acc, cv_f1, ensemble_acc, ensemble_f1):
+    metrics_summary = {
+        "CV Mean Accuracy": np.mean(cv_acc),
+        "CV Mean F1": np.mean(cv_f1),
+        "Ensemble Test Acc": ensemble_acc,
+        "Ensemble Test F1": ensemble_f1,
+    }
+    bar_colors = ["#3498db", "#2ecc71", "#e74c3c", "#9b59b6"]
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    bars = ax.bar(metrics_summary.keys(), metrics_summary.values(),
+                  color=bar_colors, edgecolor="white", linewidth=1.5)
+    for bar in bars:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                f"{bar.get_height():.4f}", ha="center", va="bottom", fontsize=12, fontweight="bold")
+    ax.set_ylim(0, 1.1)
+    ax.set_ylabel("Score", fontsize=13)
+    ax.set_title("Model Accuracy Summary", fontsize=15, fontweight="bold")
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------
+# "MODEL PARAMETERS OVERALL SUMMARY -- DETAILED VISUALIZATION.txt"
+# ---------------------------------------------------------------------
+def plot_model_parameters_detailed(best_model):
+    total_params = best_model.count_params()
+    trainable_params = sum(tf.size(w).numpy() for w in best_model.trainable_weights)
+    non_trainable = total_params - trainable_params
+
+    print("=" * 55)
+    print(f"  Total Parameters:         {total_params:>15,}")
+    print(f"  Trainable Parameters:     {trainable_params:>15,}")
+    print(f"  Non-Trainable Parameters: {non_trainable:>15,}")
+    print(f"  Model Size (approx):      {total_params * 4 / 1024**2:>14.2f} MB")
+    print("=" * 55)
+
+    layer_data = []
+    for layer in best_model.layers:
+        trainable_p = sum(tf.size(w).numpy() for w in layer.trainable_weights)
+        non_train_p = sum(tf.size(w).numpy() for w in layer.non_trainable_weights)
+        total_p = trainable_p + non_train_p
+        output_shape = str(layer.output_shape) if hasattr(layer, "output_shape") else "N/A"
+        layer_data.append({
+            "name": layer.name, "type": layer.__class__.__name__, "output_shape": output_shape,
+            "trainable": trainable_p, "non_trainable": non_train_p, "total": total_p,
+        })
+
+    df = pd.DataFrame(layer_data)
+    df = df[df["total"] > 0]
+    print(f"\nLayers with parameters: {len(df)} / {len(best_model.layers)}")
+    print(df.to_string(index=False))
+
+    figs = []
+
+    # Fig 1: top-15 bar chart + layer-type pie chart
+    df_sorted = df.sort_values("total", ascending=False).head(15)
+    fig1, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig1.suptitle("Model Parameter Distribution", fontsize=15, fontweight="bold")
+
+    colors = plt.cm.RdYlGn(np.linspace(0.2, 0.9, len(df_sorted)))[::-1]
+    bars = axes[0].barh(df_sorted["name"], df_sorted["total"], color=colors, edgecolor="white", linewidth=0.5)
+    axes[0].set_xlabel("Parameter Count", fontsize=11)
+    axes[0].set_title("Top 15 Layers by Parameter Count", fontsize=12, fontweight="bold")
+    axes[0].invert_yaxis()
+    axes[0].spines[["top", "right"]].set_visible(False)
+    axes[0].grid(axis="x", linestyle="--", alpha=0.4)
+    for bar, val in zip(bars, df_sorted["total"]):
+        axes[0].text(bar.get_width() + total_params * 0.001, bar.get_y() + bar.get_height() / 2,
+                     f"{val:,}", va="center", fontsize=8, fontweight="bold")
+
+    type_counts = df.groupby("type")["total"].sum().sort_values(ascending=False)
+    pie_colors = plt.cm.Set3(np.linspace(0, 1, len(type_counts)))
+    wedges, texts, autotexts = axes[1].pie(
+        type_counts.values, labels=type_counts.index, autopct="%1.1f%%",
+        colors=pie_colors, startangle=140, wedgeprops={"edgecolor": "white", "linewidth": 1.5})
+    for text in autotexts:
+        text.set_fontsize(8)
+        text.set_fontweight("bold")
+    axes[1].set_title("Parameters by Layer Type", fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    figs.append(fig1)
+
+    # Fig 2: trainable vs non-trainable, top-10 stacked bar
+    df_top = df.sort_values("total", ascending=False).head(10)
+    fig2, ax = plt.subplots(figsize=(14, 5))
+    fig2.suptitle("Trainable vs Non-Trainable — Top 10 Layers", fontsize=14, fontweight="bold")
+
+    x = np.arange(len(df_top))
+    w = 0.6
+    ax.bar(x, df_top["trainable"], width=w, label="Trainable", color="#2ecc71", edgecolor="white", linewidth=0.5)
+    ax.bar(x, df_top["non_trainable"], width=w, bottom=df_top["trainable"],
+           label="Non-Trainable", color="#e74c3c", edgecolor="white", linewidth=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(df_top["name"], rotation=35, ha="right", fontsize=9)
+    ax.set_ylabel("Parameter Count", fontsize=11)
+    ax.legend(fontsize=10)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    for xi, (_, row) in zip(x, df_top.iterrows()):
+        ax.text(xi, row["total"] + total_params * 0.002, f"{row['total']:,}",
+                ha="center", fontsize=7, fontweight="bold", rotation=45)
+    plt.tight_layout()
+    figs.append(fig2)
+
+    return figs, df
