@@ -1,0 +1,108 @@
+"""
+Full ASAM-CNN pipeline, end to end — reproduces every visualization from
+the original Zenodo.rar export.
+
+Usage:
+    python main.py --config configs/config.yaml
+"""
+
+import argparse
+import os
+
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import yaml
+
+from src.evaluate import evaluate_ensemble_and_tta
+from src.model import CUSTOM_OBJECTS
+from src.preprocess import circular_crop, apply_clahe_rgb, preprocess
+from src.train import run_cross_validation, load_class_folder
+from src.utils import enable_figure_autosave, find_dataset_root
+
+from src.visualize_core import (
+    plot_sample_images, plot_preprocessing_pipeline, plot_augmentation_effects,
+    plot_class_distribution, plot_cv_bar, plot_learning_curves, plot_confusion_matrix,
+    plot_precision_recall_f1, plot_roc_curves, plot_misclassified_images,
+    plot_model_accuracy_summary, plot_model_parameters_detailed,
+)
+from src.interpretability import (
+    get_sample_images, get_conv_layers, plot_gradcam_lesion_localization,
+    plot_attention_map_visualization, plot_attention_heatmap_comparison,
+    plot_class_activation_comparison, plot_asam_vs_gradcam_agreement, plot_tsne,
+)
+from src.asam_internals import (
+    setup_asam_internals, plot_adaptive_scale_heatmap, plot_dynamic_temperature_value,
+    plot_dual_path_alpha_blending, plot_asam_output_attention_map, plot_local_vs_global_path,
+)
+
+
+def main(cfg: dict):
+    enable_figure_autosave(cfg["paths"]["figures_dir"])
+
+    # --- Train + Evaluate ---
+    cv_result = run_cross_validation(cfg)
+    class_names = cv_result["class_names"]
+    num_classes = len(class_names)
+
+    dataset_root = find_dataset_root(cfg["paths"]["input_root"])
+    train_dir = os.path.join(dataset_root, "Training-validation")
+    test_dir = os.path.join(dataset_root, "Testing")
+
+    eval_result = evaluate_ensemble_and_tta(cfg, cv_result)
+    best_model = tf.keras.models.load_model(cv_result["best_ckpt"], custom_objects=CUSTOM_OBJECTS)
+
+    X_test, y_test = eval_result["X_test"], eval_result["y_test"]
+    y_pred, y_pred_proba = eval_result["y_pred"], eval_result["y_pred_proba"]
+
+    _, y_train = load_class_folder(train_dir, class_names, cfg["img_size"])
+
+    # --- Dataset / training / evaluation visualizations ---
+    plot_sample_images(train_dir, class_names, img_size=cfg["img_size"]); plt.show()
+    plot_preprocessing_pipeline(train_dir, class_names, circular_crop, apply_clahe_rgb,
+                                 img_size=cfg["img_size"]); plt.show()
+    for _ in plot_augmentation_effects(train_dir, class_names, lambda p: preprocess(p, cfg["img_size"])):
+        plt.show()
+    plot_class_distribution(y_train, y_test, class_names); plt.show()
+    plot_cv_bar(cv_result["cv_acc"], "Validation Accuracy", cfg["n_folds"]); plt.show()
+    plot_cv_bar(cv_result["cv_f1"], "Macro F1 Score", cfg["n_folds"]); plt.show()
+    plot_learning_curves(cv_result["cv_history"], cfg["n_folds"]); plt.show()
+    plot_confusion_matrix(y_test, y_pred, class_names); plt.show()
+    plot_precision_recall_f1(y_test, y_pred, class_names); plt.show()
+    plot_roc_curves(y_test, y_pred_proba, class_names); plt.show()
+    plot_misclassified_images(X_test, y_test, y_pred, y_pred_proba, class_names); plt.show()
+    plot_model_accuracy_summary(cv_result["cv_acc"], cv_result["cv_f1"],
+                                 eval_result["ensemble_acc"], eval_result["ensemble_f1"]); plt.show()
+    for _ in plot_model_parameters_detailed(best_model)[0]:
+        plt.show()
+
+    # --- Interpretability ---
+    sample_images = get_sample_images(test_dir, class_names, lambda p: preprocess(p, cfg["img_size"]))
+    conv_layers = get_conv_layers(best_model)
+
+    plot_gradcam_lesion_localization(best_model, sample_images, class_names, conv_layers,
+                                      img_size=cfg["img_size"]); plt.show()
+    plot_attention_map_visualization(best_model, sample_images, class_names, img_size=cfg["img_size"]); plt.show()
+    plot_attention_heatmap_comparison(best_model, sample_images, class_names, img_size=cfg["img_size"]); plt.show()
+    plot_class_activation_comparison(best_model, sample_images, X_test, y_test, class_names,
+                                      conv_layers, img_size=cfg["img_size"]); plt.show()
+    plot_asam_vs_gradcam_agreement(best_model, X_test, y_test, y_pred, class_names); plt.show()
+    plot_tsne(best_model, X_test, y_test, class_names, seed=cfg["seed"]); plt.show()
+
+    # --- ASAM internal-mechanism visualizations (reconstructed setup — see asam_internals.py) ---
+    ctx = setup_asam_internals(best_model, sample_images, viz_dir=cfg["paths"]["figures_dir"] + "_asam_internals")
+    plot_adaptive_scale_heatmap(ctx, class_names, num_classes)
+    plot_dynamic_temperature_value(ctx, class_names, num_classes)
+    plot_dual_path_alpha_blending(ctx, class_names, num_classes)
+    _, asam_add_name = plot_asam_output_attention_map(ctx, class_names, num_classes, img_size=cfg["img_size"])
+    plot_local_vs_global_path(ctx, class_names, num_classes, img_size=cfg["img_size"], asam_add_name=asam_add_name)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/config.yaml")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    main(cfg)
