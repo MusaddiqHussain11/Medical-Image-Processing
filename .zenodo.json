@@ -1,0 +1,11 @@
+{
+  "title": "ASAM-CNN: A Lightweight Multi-Component Adaptive Self-Attention Network for Tympanic Membrane Disease Classification from Otoscopic Images",
+  "description": "Official implementation of ASAM-CNN, a lightweight CNN with a novel multi-component Adaptive Self-Attention Module for tympanic membrane disease classification from otoscopic images.",
+  "creators": [
+    {"name": "Hussain, Musaddiq", "affiliation": "Virtual University of Pakistan"},
+    {"name": "Malik, Hassaan", "affiliation": "NCBA&E Sub Campus Multan"}
+  ],
+  "keywords": ["tympanic membrane", "otoscopic images", "self-attention", "CNN", "medical image classification"],
+  "license": "MIT",
+  "upload_type": "software"
+}
